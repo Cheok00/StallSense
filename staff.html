@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StallSense Staff</title>
+  <meta name="description" content="Stall staff record new and ready orders.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <a class="brand" href="index.html">StallSense</a>
+      <nav>
+        <a href="index.html">Students</a>
+        <a href="staff.html" class="active">Staff</a>
+        <a href="demo.html">Demo controls</a>
+      </nav>
+    </header>
+
+    <!-- Shown when no stall is chosen yet -->
+    <section id="choose" hidden>
+      <h1>Staff page</h1>
+      <p class="lead">Choose your stall. Bookmark the page it opens so you go straight there next time.</p>
+      <div class="grid" id="stall-links"></div>
+    </section>
+
+    <!-- The stall's own page -->
+    <section id="console" hidden>
+      <h1 id="stall-name"></h1>
+      <p class="lead" id="stall-place"></p>
+      <p class="notice">Prototype: orders here are for the demo. Only order numbers and times are recorded, never student details. <span id="mode"></span></p>
+
+      <div class="status-line">
+        <span id="conn"></span>
+        <span id="sync" class="muted small"></span>
+        <button id="toggle-offline">Simulate disconnect</button>
+      </div>
+
+      <div class="staff-buttons">
+        <button class="primary" id="new-order">+ New order</button>
+        <button id="next-ready">Next order ready</button>
+      </div>
+
+      <div class="two-col">
+        <div class="mini">
+          <div class="muted small">Your queue (this device)</div>
+          <div class="wait" id="mine-wait"></div>
+          <div class="muted small" id="mine-meta"></div>
+        </div>
+        <div class="mini">
+          <div class="muted small">What students see right now</div>
+          <div class="wait" id="students-wait"></div>
+          <div class="muted small" id="students-meta"></div>
+        </div>
+      </div>
+
+      <h2 style="margin-top:20px">Orders waiting</h2>
+      <ul class="orders" id="orders"></ul>
+      <p class="muted small" id="empty">No orders waiting.</p>
+    </section>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/stalls.js"></script>
+  <script src="js/estimate.js"></script>
+  <script src="js/backend-local.js"></script>
+  <script src="js/backend-firebase.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/outbox.js"></script>
+  <script>
+  (function () {
+    const { STALLS, findStall, getStore, newId, modeBadge, createOutbox, esc } = SS;
+    const { stallStats, labelDetail } = SS.estimate;
+
+    const $ = (id) => document.getElementById(id);
+    const stall = findStall(new URLSearchParams(location.search).get("stall"));
+
+    if (!stall) {
+      $("choose").hidden = false;
+      $("stall-links").innerHTML = STALLS.map((s) =>
+        `<a class="card" style="text-decoration:none;color:inherit" href="staff.html?stall=${s.id}">
+          <div class="name">${esc(s.name)}</div><div class="place">${esc(s.place)}</div></a>`).join("");
+    } else {
+      startConsole(stall);
+    }
+
+    async function startConsole(stall) {
+      $("console").hidden = false;
+      document.title = `${stall.name} · StallSense Staff`;
+      $("stall-name").textContent = stall.name;
+      $("stall-place").textContent = stall.place;
+      const store = await getStore();
+      $("mode").innerHTML = modeBadge();
+      const outbox = createOutbox(store, `stallsense-outbox-${stall.id}`);
+      let server = { orders: [], stalls: {}, recs: [] };
+
+      // This device's view: what the cloud has, plus changes not sent yet.
+      function localView() {
+        const map = new Map();
+        server.orders.filter((o) => o.stallId === stall.id).forEach((o) => map.set(o.id, { ...o }));
+        for (const op of outbox.items) {
+          if (op.type === "add" && !map.has(op.order.id)) map.set(op.order.id, { ...op.order, pending: true });
+          if (op.type === "ready" && map.has(op.id)) Object.assign(map.get(op.id), { readyAt: op.at, pending: true });
+        }
+        return [...map.values()];
+      }
+
+      function nextNumber(orders) {
+        const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+        const today = orders.filter((o) => o.createdAt >= midnight.getTime() && o.source !== "sim");
+        return today.reduce((max, o) => Math.max(max, o.num || 0), 0) + 1;
+      }
+
+      function waitText(st) {
+        return st.available ? `About ${st.low}–${st.high} min` : "Estimate unavailable";
+      }
+
+      function render() {
+        const now = Date.now();
+        const orders = localView();
+        const waiting = orders.filter((o) => !o.readyAt).sort((a, b) => a.createdAt - b.createdAt);
+
+        const connected = outbox.isConnected();
+        $("conn").innerHTML = connected
+          ? `<span class="dot"></span>Connected`
+          : `<span class="dot off"></span>${outbox.simulatedOffline ? "Disconnected (simulated)" : "Offline"}`;
+        const pending = outbox.items.length;
+        $("sync").textContent = pending
+          ? `${pending} change${pending === 1 ? "" : "s"} saved on this device, sending when connected`
+          : "All changes synced";
+        $("toggle-offline").textContent = outbox.simulatedOffline ? "Reconnect" : "Simulate disconnect";
+
+        // Your queue: includes changes still waiting to sync, so staff never lose track.
+        const mineState = { orders, stalls: { [stall.id]: { lastSeen: now } }, recs: server.recs };
+        const mine = stallStats(stall, mineState, now);
+        $("mine-wait").textContent = waitText(mine);
+        $("mine-meta").textContent = `${mine.waiting} waiting · ${mine.label}`;
+
+        const theirs = stallStats(stall, server, now);
+        $("students-wait").textContent = waitText(theirs);
+        $("students-meta").textContent = `${theirs.waiting} waiting · ${theirs.label} · ${labelDetail(theirs)}`;
+
+        $("orders").innerHTML = waiting.map((o) => {
+          const mins = Math.max(0, Math.round((now - o.createdAt) / 60000));
+          return `<li>
+            <span class="num">#${o.num ?? "?"}</span>
+            <span class="when">${mins} min ago${o.source === "sim" ? " · simulated" : ""}
+              ${o.pending ? `<span class="pending">· not synced yet</span>` : ""}</span>
+            <button data-ready="${esc(o.id)}">Ready</button>
+          </li>`;
+        }).join("");
+        $("empty").hidden = waiting.length > 0;
+        $("next-ready").disabled = waiting.length === 0;
+      }
+
+      function markReady(id) {
+        outbox.push({ type: "ready", id, at: Date.now() });
+      }
+
+      $("new-order").addEventListener("click", () => {
+        const orders = localView();
+        const order = {
+          id: newId(stall.id), stallId: stall.id, num: nextNumber(orders),
+          createdAt: Date.now(), readyAt: null, source: "staff"
+        };
+        outbox.push({ type: "add", order });
+      });
+
+      $("next-ready").addEventListener("click", () => {
+        const oldest = localView().filter((o) => !o.readyAt).sort((a, b) => a.createdAt - b.createdAt)[0];
+        if (oldest) markReady(oldest.id);
+      });
+
+      $("orders").addEventListener("click", (e) => {
+        const id = e.target.getAttribute("data-ready");
+        if (id) markReady(id);
+      });
+
+      $("toggle-offline").addEventListener("click", () => {
+        outbox.setSimulatedOffline(!outbox.simulatedOffline);
+        if (!outbox.simulatedOffline) store.heartbeat(stall.id);
+      });
+
+      // Tell the cloud this stall is still online, even when no orders come in.
+      function beat() {
+        if (outbox.isConnected()) store.heartbeat(stall.id).catch(() => {});
+      }
+      beat();
+      setInterval(beat, 20000);
+
+      outbox.onChange(render);
+      store.subscribe((s) => { server = s; render(); });
+      setInterval(render, 10000);
+    }
+  })();
+  </script>
+</body>
+</html>

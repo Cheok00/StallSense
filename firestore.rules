@@ -1,0 +1,32 @@
+rules_version = '2';
+
+// Prototype rules for the hackathon demo. Anyone with the link can read and
+// write, but only in the expected shape. Before any real use, add sign-in for
+// staff and remove public delete.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /orders/{orderId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.keys().hasOnly(['stallId', 'num', 'createdAt', 'readyAt', 'source'])
+        && request.resource.data.stallId is string
+        && request.resource.data.createdAt is number;
+      allow delete: if true; // used by "Clear all data" on the demo page
+    }
+
+    match /stalls/{stallId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.keys().hasOnly(['lastSeen'])
+        && request.resource.data.lastSeen is number;
+      allow delete: if true;
+    }
+
+    match /recs/{recId} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasOnly(['stallId', 'at'])
+        && request.resource.data.stallId is string
+        && request.resource.data.at is number;
+      allow delete: if true;
+    }
+  }
+}

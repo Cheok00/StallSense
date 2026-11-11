@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StallSense Demo</title>
+  <meta name="description" content="Simulate a lunch rush and test smart spreading.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <a class="brand" href="index.html">StallSense</a>
+      <nav>
+        <a href="index.html">Students</a>
+        <a href="staff.html">Staff</a>
+        <a href="demo.html" class="active">Demo controls</a>
+      </nav>
+    </header>
+
+    <h1>Demo controls</h1>
+    <p class="lead">Simulate a lunch rush so the student page has data straight away, and test smart spreading.</p>
+    <p class="notice">Everything created here is marked as simulated. <span id="mode"></span></p>
+
+    <section class="panel">
+      <h2>1. Lunch rush simulator</h2>
+      <p class="muted small">Loads 10 minutes of recent orders for every stall, then keeps adding and finishing orders while it runs. Keep this tab open while it runs.</p>
+      <div class="row">
+        <button class="primary" id="seed">Load lunch rush data</button>
+        <button id="rush">Start live rush</button>
+        <button class="danger" id="reset">Clear all data</button>
+      </div>
+      <p class="muted small" id="sim-status">Not running.</p>
+      <p class="muted small">To show a stall disconnecting, stop the live rush first, because it keeps every stall's status fresh.</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Stall</th><th>Waiting</th><th>Speed</th><th>Students see</th><th>Status</th><th>Staff page</th></tr></thead>
+          <tbody id="status"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>2. Smart spreading test</h2>
+      <p class="muted small">Runs the same lunch rush twice. <strong>Shortest queue</strong> sends everyone to whichever stall looks shortest, like a plain queue app. <strong>Smart spreading</strong> also counts students already walking to each stall.</p>
+      <div class="row">
+        <label class="field">Students in the rush
+          <select id="students">
+            <option value="100">100</option>
+            <option value="150" selected>150</option>
+            <option value="200">200</option>
+          </select>
+        </label>
+        <label class="field">Rush length
+          <select id="minutes">
+            <option value="20">20 min</option>
+            <option value="30" selected>30 min</option>
+            <option value="45">45 min</option>
+          </select>
+        </label>
+        <label class="field">Walk to stalls
+          <select id="walk">
+            <option value="2">2 min</option>
+            <option value="3" selected>3 min</option>
+            <option value="5">5 min</option>
+          </select>
+        </label>
+        <button class="primary" id="run">Run test</button>
+      </div>
+      <div id="results"></div>
+      <p class="muted small">Assumes every student follows the app and each stall works at its typical speed. Real results would be smaller, because not everyone uses the app.</p>
+    </section>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/stalls.js"></script>
+  <script src="js/estimate.js"></script>
+  <script src="js/backend-local.js"></script>
+  <script src="js/backend-firebase.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/spread.js"></script>
+  <script>
+  (async function () {
+    const { STALLS, getStore, newId, modeBadge, runSpreadTest } = SS;
+    const { stallStats } = SS.estimate;
+
+    const $ = (id) => document.getElementById(id);
+    const MIN = 60000;
+
+    const store = await getStore();
+    $("mode").innerHTML = modeBadge();
+    let state = { orders: [], stalls: {}, recs: [] };
+
+    // How much busier than its speed each stall gets during the rush (>1 builds a queue).
+    const RUSH = { "chicken-rice": 1.35, noodles: 1.15, western: 1.3, "mixed-rice": 0.9, roti: 1.2, drinks: 0.8 };
+    const START_QUEUE = { "chicken-rice": 12, noodles: 6, western: 9, "mixed-rice": 4, roti: 14, drinks: 2 };
+
+    function render() {
+      const now = Date.now();
+      $("status").innerHTML = STALLS.map((s) => {
+        const st = stallStats(s, state, now);
+        const shown = st.available ? `${st.low}–${st.high} min` : "Unavailable";
+        return `<tr><td>${s.name}</td><td>${st.waiting}</td><td>${st.rate.toFixed(1)}/min</td>
+          <td>${shown}</td><td><span class="chip ${st.level}">${st.label}</span></td>
+          <td><a href="staff.html?stall=${s.id}" target="_blank">Open</a></td></tr>`;
+      }).join("");
+    }
+
+    // Load lunch rush data: finished orders over the last 10 minutes plus a waiting queue.
+    $("seed").addEventListener("click", async () => {
+      const now = Date.now();
+      const orders = [];
+      let num = 500;
+      for (const s of STALLS) {
+        const finished = Math.round(s.baseRate * 10 * (0.85 + Math.random() * 0.3));
+        for (let i = 0; i < finished; i++) {
+          const readyAt = now - ((i + 0.5) / finished) * 10 * MIN;
+          const createdAt = readyAt - (3 + Math.random() * 6) * MIN;
+          orders.push({ id: newId(s.id), stallId: s.id, num: num++, createdAt, readyAt, source: "sim" });
+        }
+        const queue = START_QUEUE[s.id] ?? 5;
+        for (let i = 0; i < queue; i++) {
+          const createdAt = now - (i / Math.max(queue, 1)) * 8 * MIN;
+          orders.push({ id: newId(s.id), stallId: s.id, num: num++, createdAt, readyAt: null, source: "sim" });
+        }
+      }
+      $("sim-status").textContent = "Loading…";
+      await store.bulkAdd(orders);
+      await Promise.all(STALLS.map((s) => store.heartbeat(s.id)));
+      $("sim-status").textContent = `Loaded ${orders.length} simulated orders.` + (timer ? " Live rush running." : "");
+    });
+
+    // Live rush: every 2 seconds, new orders arrive and stalls finish orders at their speed.
+    let timer = null;
+    let lastBeat = 0;
+    const credit = {};
+    let simNum = 900;
+
+    function tick() {
+      const now = Date.now();
+      const step = 2 / 60; // minutes per tick
+      for (const s of STALLS) {
+        const waiting = state.orders
+          .filter((o) => o.stallId === s.id && !o.readyAt && o.source === "sim")
+          .sort((a, b) => a.createdAt - b.createdAt);
+
+        const busy = waiting.length > 25 ? 0.5 : RUSH[s.id] ?? 1;
+        if (Math.random() < s.baseRate * busy * step) {
+          store.addOrder({ id: newId(s.id), stallId: s.id, num: simNum++, createdAt: now, readyAt: null, source: "sim" });
+        }
+
+        credit[s.id] = (credit[s.id] || 0) + s.baseRate * step;
+        let i = 0;
+        while (credit[s.id] >= 1 && i < waiting.length) {
+          store.markReady(waiting[i].id, now);
+          credit[s.id] -= 1;
+          i++;
+        }
+        if (i === waiting.length) credit[s.id] = Math.min(credit[s.id], 1);
+      }
+      if (now - lastBeat > 20000) {
+        lastBeat = now;
+        STALLS.forEach((s) => store.heartbeat(s.id));
+      }
+    }
+
+    $("rush").addEventListener("click", () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+        $("rush").textContent = "Start live rush";
+        $("sim-status").textContent = "Stopped.";
+      } else {
+        timer = setInterval(tick, 2000);
+        tick();
+        $("rush").textContent = "Stop live rush";
+        $("sim-status").textContent = "Live rush running. Keep this tab open.";
+      }
+    });
+
+    $("reset").addEventListener("click", async () => {
+      if (!confirm("Clear all orders, stall status and suggestions? This can't be undone.")) return;
+      await store.resetAll();
+      $("sim-status").textContent = "All data cleared.";
+    });
+
+    // Smart spreading test
+    function bars(perStall, maxStudents) {
+      return perStall.map((p) => `<div class="bar-row"><span>${p.name}</span>
+        <div class="bar ${p.longest > 15 ? "hot" : ""}" style="width:${(p.students / maxStudents) * 100}%"></div>
+        <span>${p.students}</span></div>`).join("");
+    }
+
+    function result(title, r, maxStudents) {
+      return `<div class="result mini"><h3>${title}</h3>
+        <div class="muted small">Longest wait</div><div class="stat">${r.longest.toFixed(1)} min</div>
+        <div class="muted small">Average wait ${r.average.toFixed(1)} min · ${r.over15} students waited over 15 min</div>
+        <div class="muted small" style="margin-top:8px">Students sent to each stall (red = someone waited over 15 min)</div>
+        ${bars(r.perStall, maxStudents)}</div>`;
+    }
+
+    $("run").addEventListener("click", () => {
+      const r = runSpreadTest(STALLS, {
+        students: Number($("students").value),
+        minutes: Number($("minutes").value),
+        walk: Number($("walk").value)
+      });
+      const max = Math.max(...r.plain.perStall.map((p) => p.students), ...r.smart.perStall.map((p) => p.students), 1);
+      const cut = r.plain.longest > 0 ? Math.round((1 - r.smart.longest / r.plain.longest) * 100) : 0;
+      $("results").innerHTML = `<p style="margin:12px 0 0"><strong>Smart spreading cut the longest wait by ${cut}%</strong>
+        (${r.plain.longest.toFixed(1)} → ${r.smart.longest.toFixed(1)} min).</p>
+        <div class="result-grid">${result("Shortest queue", r.plain, max)}${result("Smart spreading", r.smart, max)}</div>`;
+    });
+
+    store.subscribe((s) => { state = s; render(); });
+    setInterval(render, 10000);
+  })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StallSense</title>
+  <meta name="description" content="Live order counts and wait times for campus food stalls.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <a class="brand" href="index.html">StallSense</a>
+      <nav>
+        <a href="index.html" class="active">Students</a>
+        <a href="staff.html">Staff</a>
+        <a href="demo.html">Demo controls</a>
+      </nav>
+    </header>
+
+    <h1>How long is the wait?</h1>
+    <p class="lead">Live order counts and estimated waits for campus food stalls, so you can decide before you walk there.</p>
+    <p class="notice">Prototype: stalls and orders are simulated for the hackathon demo. StallSense collects no student information. <span id="mode"></span></p>
+
+    <section class="panel">
+      <h2>Where should I eat?</h2>
+      <p class="muted small">Suggests the stall where you'll get food fastest, counting students already heading to each stall so everyone isn't sent to the same queue.</p>
+      <button class="primary" id="pick-btn">Pick a stall for me</button>
+      <div class="pick" id="pick"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Will I make it to class?</h2>
+      <div class="row">
+        <label class="field">Next class starts
+          <input type="time" id="class-time">
+        </label>
+        <label class="field">Time to eat
+          <select id="eat">
+            <option value="0">Takeaway</option>
+            <option value="10">Quick meal (10 min)</option>
+            <option value="20" selected>Sit down (20 min)</option>
+          </select>
+        </label>
+        <label class="field">Walk to class
+          <select id="walk-class">
+            <option value="3">3 min</option>
+            <option value="5" selected>5 min</option>
+            <option value="10">10 min</option>
+          </select>
+        </label>
+        <button id="clear-class">Clear</button>
+      </div>
+      <p class="muted small" id="class-hint">Enter your next class time to see which stalls you have time for. It uses the longer end of each wait to stay safe.</p>
+    </section>
+
+    <h2>All stalls</h2>
+    <div class="grid" id="stalls"></div>
+
+    <section class="how panel">
+      <h2>How the wait is worked out</h2>
+      <p><strong>Wait = (orders waiting + your order) ÷ orders the stall finished per minute in the last 10 minutes.</strong></p>
+      <ul>
+        <li>It's shown as a range, because it's an estimate.</li>
+        <li><strong>Live</strong>: measured from the last 10 minutes. <strong>Estimate</strong>: not enough recent orders yet, so it uses the stall's typical speed.</li>
+        <li><strong>Recent report</strong>: the stall hasn't updated for over 2 minutes, for example because its connection dropped.</li>
+        <li><strong>Estimate unavailable</strong>: no update for over 15 minutes, so no number is shown rather than a wrong one.</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/stalls.js"></script>
+  <script src="js/estimate.js"></script>
+  <script src="js/backend-local.js"></script>
+  <script src="js/backend-firebase.js"></script>
+  <script src="js/store.js"></script>
+  <script>
+  (async function () {
+    const { STALLS, newId, getStore, modeBadge } = SS;
+    const { stallStats, labelDetail, recommend, willIMakeIt } = SS.estimate;
+
+    const $ = (id) => document.getElementById(id);
+
+    const store = await getStore();
+    $("mode").innerHTML = modeBadge();
+    let state = { orders: [], stalls: {}, recs: [] };
+    let lastPick = 0;
+    const esc = SS.esc;
+
+    function classTimeMs() {
+      const v = $("class-time").value;
+      if (!v) return null;
+      const [h, m] = v.split(":").map(Number);
+      const d = new Date();
+      d.setHours(h, m, 0, 0);
+      return d.getTime();
+    }
+
+    function verdictHtml(st) {
+      const ct = classTimeMs();
+      if (ct === null) return "";
+      const r = willIMakeIt(st, ct, { eatMins: Number($("eat").value), walkToClass: Number($("walk-class").value) });
+      if (r.verdict === "unknown") return `<div class="verdict unknown">Can't tell: no recent data</div>`;
+      if (r.verdict === "yes") return `<div class="verdict yes">Yes, about ${r.spare} min to spare</div>`;
+      if (r.verdict === "tight") return `<div class="verdict tight">Tight, under 5 min to spare</div>`;
+      return `<div class="verdict no">No, you'd be about ${-r.spare} min late</div>`;
+    }
+
+    function render() {
+      const now = Date.now();
+      const stats = STALLS.map((s) => stallStats(s, state, now));
+      stats.sort((a, b) => (b.available - a.available) || (a.high - b.high));
+      $("stalls").innerHTML = stats.map((st) => {
+        const waitText = st.available ? `About ${st.low}–${st.high} min` : "Estimate unavailable";
+        const orders = st.waiting === 1 ? "1 order waiting" : `${st.waiting} orders waiting`;
+        const enRoute = st.enRoute ? ` · ${st.enRoute} on the way` : "";
+        return `<article class="card ${st.level}">
+          <div><div class="name">${esc(st.stall.name)}</div><div class="place">${esc(st.stall.place)} · ${st.stall.walk} min walk</div></div>
+          <div class="wait">${waitText}</div>
+          <div class="meta">${orders}${enRoute}</div>
+          <span class="chip ${st.level}">${st.label}</span>
+          <div class="meta small">${labelDetail(st)}</div>
+          ${verdictHtml(st)}
+        </article>`;
+      }).join("");
+      $("class-hint").style.display = classTimeMs() === null ? "" : "none";
+    }
+
+    $("pick-btn").addEventListener("click", async () => {
+      const now = Date.now();
+      const stats = STALLS.map((s) => stallStats(s, state, now));
+      const best = recommend(stats);
+      const box = $("pick");
+      box.classList.add("show");
+      if (!best) {
+        box.innerHTML = `<p class="muted">No stall has recent data right now, so there's nothing reliable to suggest.</p>`;
+        return;
+      }
+      const st = best.stats;
+      const foodIn = Math.round(best.total);
+      box.innerHTML = `<div class="big">Go to ${esc(st.stall.name)}</div>
+        <div class="muted">${esc(st.stall.place)} · ${st.stall.walk} min walk · food in about ${foodIn} min</div>
+        <div class="muted small">Counted ${st.enRoute} other student${st.enRoute === 1 ? "" : "s"} already heading there.</div>`;
+      // Record the suggestion so the next student sees this stall as a bit busier.
+      if (now - lastPick > 10000) {
+        lastPick = now;
+        await store.addRec({ id: newId("rec"), stallId: st.stall.id, at: now });
+      }
+    });
+
+    for (const id of ["class-time", "eat", "walk-class"]) $(id).addEventListener("input", render);
+    $("clear-class").addEventListener("click", () => { $("class-time").value = ""; render(); });
+
+    store.subscribe((s) => { state = s; render(); });
+    setInterval(render, 15000);
+  })();
+  </script>
+</body>
+</html>
